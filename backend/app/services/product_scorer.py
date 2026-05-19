@@ -93,12 +93,27 @@ class ProductScorer:
         if not reasons:
             reasons.append("作为通用候选商品保留")
 
+        display_reason = self._build_display_reason(reasons, penalties)
+
         return ProductScore(
             product_id=product_id,
             score=round(max(score, 0.0), 2),
             reasons=reasons,
+            matched_features=list(reasons),
             penalties=penalties,
+            display_reason=display_reason,
         )
+
+    @staticmethod
+    def _build_display_reason(reasons: list[str], penalties: list[str]) -> str:
+        if reasons:
+            primary = reasons[0]
+            if len(reasons) >= 2:
+                return f"{primary}，同时{reasons[1]}"
+            return primary
+        if penalties:
+            return "存在部分不匹配点，建议谨慎选择"
+        return "匹配当前送礼需求"
 
     def _score_budget(
         self,
@@ -183,4 +198,3 @@ class ProductScorer:
             ):
                 matches.append(item)
         return list(dict.fromkeys(matches))
-

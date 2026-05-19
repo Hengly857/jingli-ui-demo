@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     embedding_model: str = "mock-embedding"
     vision_model: str = "mock-vision"
+    recommendation_strategy: str = "llm_direct"
 
     upload_dir: str = "storage/uploads"
     max_upload_mb: int = 50

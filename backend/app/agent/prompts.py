@@ -47,6 +47,7 @@ from app.agent.prompts_lib.intent_extraction import (  # noqa: E402,F401
 )
 from app.agent.prompts_lib.product_rerank import (  # noqa: E402,F401
     PRODUCT_RERANK_PROMPT,
+    build_product_rerank_prompt,
 )
 
 __all__ = [
@@ -65,4 +66,5 @@ __all__ = [
     "INTENT_EXTRACTION_SYSTEM_PROMPT",
     "build_intent_extraction_prompt",
     "PRODUCT_RERANK_PROMPT",
+    "build_product_rerank_prompt",
 ]

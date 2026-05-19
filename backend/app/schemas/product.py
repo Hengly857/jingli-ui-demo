@@ -37,6 +37,9 @@ class ProductCard(BaseModel):
     tags: list[str] = []
     highlights: list[str] = []
     reason: str
+    display_reason: str | None = None
+    matched_features: list[str] = Field(default_factory=list)
+    penalties: list[str] = Field(default_factory=list)
     detail_url: str | None = None
     scenarios: list[str] = Field(default_factory=list)
     target_people: list[str] = Field(default_factory=list)

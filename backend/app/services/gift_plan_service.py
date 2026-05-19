@@ -35,12 +35,33 @@ class GiftPlanService:
         recommendation = await self.recommendations.recommend_products(
             RecommendationRequest(
                 message=request.message,
+                user_id=request.user_id,
+                conversation_id=request.conversation_id,
                 budget=budget,
                 preference=request.preference,
                 max_products=4,
                 include_fallback=True,
+                strategy=request.recommendation_strategy,
+                allow_generic_recommendation=request.allow_generic_recommendation,
+                use_profile=request.use_profile,
             )
         )
+        if recommendation.needs_clarification:
+            answer = recommendation.clarification_question or "我还需要补充一个关键信息，才能生成组合礼单。"
+            return GiftPlanResponse(
+                plan_id=str(uuid4()),
+                title="需要补充信息",
+                requirement=request.message,
+                strategy="推荐策略：先补全关键信息，再生成组合礼单",
+                budget=budget,
+                total_amount=Decimal("0"),
+                remaining_amount=budget,
+                usage_percent=0.0 if budget is not None else None,
+                answer=answer,
+                products=[],
+                value_points=[],
+                replacement_chips=["补充送礼对象", "补充送礼场景", "补充预算"],
+            )
         products = recommendation.products
         scores_by_product_id = {score.product_id: score for score in recommendation.scores}
 

@@ -6,7 +6,7 @@ from uuid import uuid4
 from app.agent.graph import GuideAgent
 from app.llm.client import ChatMessage
 from app.metrics.collector import MetricsCollector
-from app.schemas.chat import ChatRequest, ChatResponse, StreamEvent
+from app.schemas.chat import ChatRequest, ChatResponse, IntentState, StreamEvent
 from app.schemas.product import ProductCard
 from app.schemas.recommendation import RecommendationRequest
 from app.services.conversation_memory import ConversationMemory
@@ -23,6 +23,40 @@ class ChatService:
     async def chat(self, request: ChatRequest) -> ChatResponse:
         conversation_id = request.conversation_id or str(uuid4())
         history = self._get_history(conversation_id)
+        recommendation_message = self._build_recommendation_message(
+            request.message,
+            conversation_id=conversation_id,
+        )
+        recommendation = await self.recommendations.recommend_products(
+            RecommendationRequest(
+                message=recommendation_message,
+                user_id=request.user_id,
+                conversation_id=conversation_id,
+                max_products=3,
+                include_fallback=False,
+                strategy=request.recommendation_strategy,
+                allow_generic_recommendation=request.allow_generic_recommendation,
+                use_profile=request.use_profile,
+            )
+        )
+        if recommendation.needs_clarification:
+            answer = recommendation.clarification_question or "我还需要补充一个关键信息，才能更准确推荐。"
+            message_id = str(uuid4())
+            self.memory.append_pair(
+                conversation_id,
+                user_message=request.message,
+                assistant_message=answer,
+            )
+            return ChatResponse(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                answer=answer,
+                intent=IntentState(intent="clarification"),
+                products=[],
+                citations=[],
+                needs_clarification=True,
+                clarification_question=answer,
+            )
         started = time.perf_counter()
         result = await self.agent.run(
             request.message,
@@ -59,15 +93,38 @@ class ChatService:
         conversation_id = request.conversation_id or str(uuid4())
         message_id = str(uuid4())
         history = self._get_history(conversation_id)
+        recommendation_message = self._build_recommendation_message(
+            request.message,
+            conversation_id=conversation_id,
+        )
         # 为了能在 stream 结束时记录指标，我们累计 delta 并预取推荐商品。
         recommendation = await self.recommendations.recommend_products(
             RecommendationRequest(
-                message=request.message,
+                message=recommendation_message,
+                user_id=request.user_id,
                 conversation_id=conversation_id,
                 max_products=3,
                 include_fallback=False,
+                strategy=request.recommendation_strategy,
+                allow_generic_recommendation=request.allow_generic_recommendation,
+                use_profile=request.use_profile,
             )
         )
+        if recommendation.needs_clarification:
+            answer = recommendation.clarification_question or "我还需要补充一个关键信息，才能更准确推荐。"
+            async for event in self._stream_text(answer):
+                yield event
+            self.memory.append_pair(
+                conversation_id,
+                user_message=request.message,
+                assistant_message=answer,
+            )
+            yield StreamEvent(
+                event="done",
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
+            return
         citations_n = len(recommendation.citations)
         product_cards = recommendation.products
         # 任务 6 续：将预取的候选商品作为白名单注入 prompt，避免模型编造不存在的商品。
@@ -125,6 +182,28 @@ class ChatService:
             ChatMessage(role=item.role, content=item.content)
             for item in self.memory.get_recent(conversation_id)
         ]
+
+    def _build_recommendation_message(self, message: str, *, conversation_id: str) -> str:
+        recent = self.memory.get_recent(conversation_id, max_messages=4)
+        if not recent or not self._last_assistant_asked_clarification(recent):
+            return message
+        user_messages = [item.content for item in recent if item.role == "user"]
+        if not user_messages:
+            return message
+        return "。".join([user_messages[-1], message])
+
+    @staticmethod
+    def _last_assistant_asked_clarification(history: list[object]) -> bool:
+        assistant_messages = [
+            getattr(item, "content", "")
+            for item in history
+            if getattr(item, "role", "") == "assistant"
+        ]
+        if not assistant_messages:
+            return False
+        last = assistant_messages[-1]
+        markers = ("送给谁", "什么场景", "预算", "关键信息", "主要想送给")
+        return any(marker in last for marker in markers)
 
     async def _replay_answer_with_product_cards(
         self, answer: str, product_cards: list[ProductCard]

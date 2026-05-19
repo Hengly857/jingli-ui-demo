@@ -1,15 +1,35 @@
 from __future__ import annotations
 
+import json
+import logging
+import re
 from decimal import Decimal
+from typing import Any
 
+from app.agent.prompts import (
+    GUIDE_SYSTEM_PROMPT,
+    RECOMMENDATION_PROMPT_VERSION,
+    build_product_rerank_prompt,
+)
+from app.core.config import settings
+from app.llm.client import LLMClient
 from app.schemas.gift_intent import GiftIntent
 from app.schemas.product import ProductCard
-from app.schemas.recommendation import RecommendationRequest, RecommendationResult
+from app.schemas.recommendation import (
+    RecommendationRequest,
+    RecommendationResult,
+    RecommendationStrategy,
+)
 from app.schemas.recommendation_score import ProductScore
+from app.schemas.recommendation_score import RecommendationEvidence
+from app.services.clarification_service import ClarificationService
 from app.services.intent_extractor import IntentExtractor
 from app.services.product_scorer import ProductScorer
 from app.services.retrieval_service import RetrievedProduct, RetrievalService
 from app.services.seed_product_loader import seed_product_catalog
+from app.services.user_profile_service import UserProfileService
+
+logger = logging.getLogger(__name__)
 
 
 class RecommendationService:
@@ -17,12 +37,47 @@ class RecommendationService:
 
     def __init__(self) -> None:
         self.retrieval_service = RetrievalService()
+        self.clarification_service = ClarificationService()
         self.intent_extractor = IntentExtractor()
         self.product_scorer = ProductScorer()
+        self.user_profiles = UserProfileService()
+        self.llm = LLMClient()
 
     async def recommend_products(self, request: RecommendationRequest) -> RecommendationResult:
+        strategy = self._resolve_strategy(request)
         intent = await self._resolve_intent(request)
+        profile_key = self._profile_key(request)
+        profile = self.user_profiles.get(profile_key) if request.use_profile else None
+        disliked_added = self.user_profiles.mark_dislikes_from_message(
+            profile_key if request.use_profile else None,
+            request.message,
+        )
+        if request.use_profile:
+            profile = self.user_profiles.get(profile_key)
+            intent = self.user_profiles.merge_intent(intent, profile)
         enriched = self._enrich_request(request, intent)
+        if self.clarification_service.should_ask(
+            intent,
+            allow_generic=enriched.allow_generic_recommendation,
+        ):
+            question = self.clarification_service.build_question(intent)
+            return RecommendationResult(
+                products=[],
+                citations=[],
+                intent=intent,
+                needs_clarification=True,
+                clarification_question=question,
+                missing_slots=intent.missing_slots,
+                strategy=strategy,
+                pipeline={
+                    "strategy": strategy,
+                    "needs_clarification": True,
+                    "profile_used": bool(profile),
+                    "profile_disliked_added": disliked_added,
+                    "clarification_slot": intent.missing_slots[0] if intent.missing_slots else "",
+                    "returned_count": 0,
+                },
+            )
         query = self._build_query(enriched)
         retrieval = await self.retrieval_service.hybrid_recall(
             query=query,
@@ -53,6 +108,13 @@ class RecommendationService:
         candidates = self._merge_candidates(
             [structured_candidates, knowledge_candidates, semantic_candidates]
         )
+        profile_filtered_count = 0
+        if profile is not None:
+            candidates, profile_filtered_count = self._filter_profile_candidates(
+                candidates,
+                profile.disliked_product_ids,
+                profile.recommended_product_ids,
+            )
 
         relaxed_candidates: list[tuple[ProductCard, dict[str, object]]] = []
         if not candidates and (enriched.scenarios or enriched.target_people):
@@ -75,6 +137,12 @@ class RecommendationService:
             relaxed_candidates = self._merge_candidates(
                 [relaxed_knowledge, relaxed_structured, relaxed_semantic]
             )
+            if profile is not None:
+                relaxed_candidates, profile_filtered_count = self._filter_profile_candidates(
+                    relaxed_candidates,
+                    profile.disliked_product_ids,
+                    profile.recommended_product_ids,
+                )
             candidates = relaxed_candidates
 
         fallback_candidates: list[tuple[ProductCard, dict[str, object]]] = []
@@ -97,20 +165,62 @@ class RecommendationService:
                     budget=enriched.budget,
                     max_products=enriched.max_candidates,
                 )
+            if profile is not None:
+                fallback_candidates, profile_filtered_count = self._filter_profile_candidates(
+                    fallback_candidates,
+                    profile.disliked_product_ids,
+                    profile.recommended_product_ids,
+                )
             candidates = fallback_candidates
 
-        ranked = self._rank_candidates(candidates, intent)[: enriched.max_products]
+        ranked_all = self._rank_candidates(candidates, intent)
+        rerank_meta: dict[str, int | str | bool] = {
+            "llm_rerank_enabled": strategy == "llm_rerank",
+            "llm_rerank_used": False,
+            "llm_rerank_invalid_count": 0,
+            "llm_rerank_fallback": False,
+        }
+        if strategy == "llm_rerank" and ranked_all:
+            ranked_all, rerank_meta = await self._llm_rerank_candidates(
+                message=enriched.message,
+                intent=intent,
+                ranked=ranked_all,
+                max_candidates=enriched.max_candidates,
+            )
+        ranked = ranked_all[: enriched.max_products]
         products = [
-            card.model_copy(update={"reason": score.reasons[0] if score.reasons else card.reason})
+            card.model_copy(
+                update={
+                    "reason": score.display_reason or card.reason,
+                    "display_reason": score.display_reason or card.reason,
+                    "matched_features": score.matched_features,
+                    "penalties": score.penalties,
+                }
+            )
             for card, _, score in ranked
         ]
+        evidence = [self._score_to_evidence(score) for _, _, score in ranked]
+        self._log_recommendation_evidence(strategy=strategy, evidence=evidence)
+        updated_profile = self.user_profiles.update_after_recommendation(
+            profile_key if request.use_profile else None,
+            intent=intent,
+            products=products,
+        )
 
         return RecommendationResult(
             products=products,
             citations=[chunk for chunk in chunks if chunk.get("text")],
             intent=intent,
+            needs_clarification=False,
+            missing_slots=intent.missing_slots,
             scores=[score for _, _, score in ranked],
+            evidence=evidence,
+            strategy=strategy,
             pipeline={
+                "strategy": strategy,
+                "profile_used": bool(profile or updated_profile),
+                "profile_filtered_count": profile_filtered_count,
+                "profile_disliked_added": disliked_added,
                 "structured_recall_count": len(structured_candidates),
                 "knowledge_recall_count": len(knowledge_candidates),
                 "semantic_recall_count": len(semantic_candidates),
@@ -118,6 +228,7 @@ class RecommendationService:
                 "fallback_recall_count": len(fallback_candidates),
                 "candidate_count": len(candidates),
                 "returned_count": len(ranked),
+                **rerank_meta,
             },
         )
 
@@ -384,6 +495,148 @@ class RecommendationService:
         return sorted(ranked, key=lambda item: item[2].score, reverse=True)
 
     @staticmethod
+    def _filter_profile_candidates(
+        candidates: list[tuple[ProductCard, dict[str, object]]],
+        disliked_product_ids: list[str],
+        recommended_product_ids: list[str],
+    ) -> tuple[list[tuple[ProductCard, dict[str, object]]], int]:
+        excluded = set(disliked_product_ids) | set(recommended_product_ids)
+        if not excluded:
+            return candidates, 0
+        filtered = [item for item in candidates if item[0].product_id not in excluded]
+        return filtered, len(candidates) - len(filtered)
+
+    @staticmethod
+    def _score_to_evidence(score: ProductScore) -> RecommendationEvidence:
+        return RecommendationEvidence(
+            product_id=score.product_id,
+            score=score.score,
+            matched_features=score.matched_features or score.reasons,
+            penalties=score.penalties,
+            display_reason=score.display_reason,
+        )
+
+    @staticmethod
+    def _log_recommendation_evidence(
+        *,
+        strategy: RecommendationStrategy,
+        evidence: list[RecommendationEvidence],
+    ) -> None:
+        logger.debug(
+            "recommendation_evidence strategy=%s evidence=%s",
+            strategy,
+            [
+                {
+                    "product_id": item.product_id,
+                    "score": item.score,
+                    "matched_features": item.matched_features,
+                    "penalties": item.penalties,
+                    "display_reason": item.display_reason,
+                }
+                for item in evidence
+            ],
+        )
+
+    async def _llm_rerank_candidates(
+        self,
+        *,
+        message: str,
+        intent: GiftIntent,
+        ranked: list[tuple[ProductCard, dict[str, object], ProductScore]],
+        max_candidates: int,
+    ) -> tuple[list[tuple[ProductCard, dict[str, object], ProductScore]], dict[str, int | str | bool]]:
+        shortlist = ranked[:max_candidates]
+        candidate_payload = [
+            {
+                "product_id": card.product_id,
+                "name": card.name,
+                "price": str(card.price) if card.price is not None else None,
+                "rule_score": score.score,
+                "rule_reasons": score.reasons[:3],
+                "penalties": score.penalties[:3],
+                "tags": card.tags,
+                "highlights": card.highlights,
+            }
+            for card, _product, score in shortlist
+        ]
+        prompt = build_product_rerank_prompt(
+            message=message,
+            intent=intent.model_dump(mode="json"),
+            candidates=candidate_payload,
+        )
+        try:
+            result = await self.llm.generate(
+                prompt,
+                system=GUIDE_SYSTEM_PROMPT,
+                temperature=0.1,
+                prompt_name="product_rerank",
+                prompt_version=RECOMMENDATION_PROMPT_VERSION,
+            )
+            parsed = self._parse_rerank_json(result.text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm_rerank_failed err=%s", exc)
+            parsed = None
+
+        if not parsed:
+            return ranked, {
+                "llm_rerank_enabled": True,
+                "llm_rerank_used": False,
+                "llm_rerank_invalid_count": 0,
+                "llm_rerank_fallback": True,
+            }
+
+        allowed_ids = [card.product_id for card, _product, _score in shortlist]
+        allowed = set(allowed_ids)
+        selected_raw = parsed.get("ranked_product_ids") or []
+        selected_ids = [str(item) for item in selected_raw] if isinstance(selected_raw, list) else []
+        valid_ids: list[str] = []
+        invalid_count = 0
+        for product_id in selected_ids:
+            if product_id not in allowed:
+                invalid_count += 1
+                continue
+            if product_id not in valid_ids:
+                valid_ids.append(product_id)
+
+        if not valid_ids:
+            return ranked, {
+                "llm_rerank_enabled": True,
+                "llm_rerank_used": False,
+                "llm_rerank_invalid_count": invalid_count,
+                "llm_rerank_fallback": True,
+            }
+
+        by_id = {card.product_id: item for item in ranked for card in [item[0]]}
+        reordered = [by_id[product_id] for product_id in valid_ids if product_id in by_id]
+        reordered.extend(item for item in ranked if item[0].product_id not in valid_ids)
+        return reordered, {
+            "llm_rerank_enabled": True,
+            "llm_rerank_used": True,
+            "llm_rerank_invalid_count": invalid_count,
+            "llm_rerank_fallback": False,
+        }
+
+    @staticmethod
+    def _parse_rerank_json(text: str) -> dict[str, Any] | None:
+        candidate = (text or "").strip()
+        if not candidate:
+            return None
+        fence = re.match(r"```(?:json)?\s*(.+?)\s*```", candidate, re.DOTALL | re.IGNORECASE)
+        if fence:
+            candidate = fence.group(1).strip()
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", candidate, re.DOTALL)
+            if not match:
+                return None
+            try:
+                data = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
     def _merge_candidates(
         candidate_groups: list[list[tuple[ProductCard, dict[str, object]]]],
     ) -> list[tuple[ProductCard, dict[str, object]]]:
@@ -401,6 +654,17 @@ class RecommendationService:
         if request.gift_intent is not None:
             return request.gift_intent
         return await self.intent_extractor.extract(request.message)
+
+    @staticmethod
+    def _resolve_strategy(request: RecommendationRequest) -> RecommendationStrategy:
+        strategy = request.strategy or settings.recommendation_strategy or "llm_direct"
+        if strategy in {"llm_direct", "hybrid_algorithm", "llm_rerank"}:
+            return strategy  # type: ignore[return-value]
+        return "llm_direct"
+
+    @staticmethod
+    def _profile_key(request: RecommendationRequest) -> str | None:
+        return request.user_id or request.conversation_id
 
     @staticmethod
     def _enrich_request(

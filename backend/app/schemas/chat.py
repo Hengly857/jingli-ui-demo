@@ -3,12 +3,17 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.schemas.product import ProductCard
+from app.schemas.recommendation import RecommendationStrategy
 
 
 class ChatRequest(BaseModel):
+    user_id: str | None = None
     conversation_id: str | None = None
     message: str = Field(min_length=1)
     image_ids: list[str] = []
+    recommendation_strategy: RecommendationStrategy | None = None
+    allow_generic_recommendation: bool = False
+    use_profile: bool = True
 
 
 class Citation(BaseModel):
@@ -35,6 +40,8 @@ class ChatResponse(BaseModel):
     intent: IntentState
     products: list[ProductCard] = []
     citations: list[Citation] = []
+    needs_clarification: bool = False
+    clarification_question: str | None = None
 
 
 class StreamEvent(BaseModel):

@@ -53,10 +53,17 @@ class GiftIntent(BaseModel):
             missing.append("scenario")
         if self.budget is None and self.budget_min is None and self.budget_max is None:
             missing.append("budget")
-        self.missing_slots = list(dict.fromkeys([*self.missing_slots, *missing]))
+        provided_missing: list[str] = []
+        if (
+            "preference" in self.missing_slots
+            and not self.preferences
+            and not self.gift_style
+            and not self.avoid
+        ):
+            provided_missing.append("preference")
+        self.missing_slots = list(dict.fromkeys([*provided_missing, *missing]))
 
         # 如果关键信息少于两个，建议先追问；只有预算缺失时仍可先给分档推荐。
         critical_missing = [slot for slot in self.missing_slots if slot in {"recipient", "scenario"}]
-        self.must_ask = self.must_ask or len(critical_missing) > 0
+        self.must_ask = len(critical_missing) > 0
         return self
-
