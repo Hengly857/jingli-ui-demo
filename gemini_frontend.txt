@@ -1,0 +1,1325 @@
+/**
+ * ====================================================================
+ * AI 送礼大师 (GiftyAI) - 全栈一体化本地部署脚本 (生产级架构)
+ * ====================================================================
+ * 本文件集成了 Node.js (Express) 安全后端与高保真 React (Tailwind) 移动端前端。
+ * * 核心技术展示：
+ * 1. 【安全隔离】大模型 API 密钥锁死在后端，不暴露给任何客户端请求。
+ * 2. 【指数级退避】集成弹性重试机制（Exponential Backoff），最大程度保证多模态调用稳定性。
+ * 3. 【JSON 约束控制】通过 responseSchema 强制模型输出强类型安全的送礼方案结构，杜绝 JSON 损坏。
+ * 4. 【二进制解码】前端使用 JavaScript ArrayBuffer 与 DataView 手写 RIFF WAVE 文件头，
+ * 将 Gemini TTS 返回的原始 16-bit PCM 字节流瞬间封装为标准 WAV 音频容器，实现免插件、低延迟的原生播放。
+ * 5. 【降级容灾】在未注入 API Key 的情况下自适应启动 Mock 模拟引擎，确保极速部署和演示。
+ */
+
+const express = require('express');
+const http = require('http');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 读取系统环境变量中的 Gemini API Key
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+// 中间件配置
+app.use(express.json({ limit: '10mb' }));
+
+/**
+ * 弹性辅助函数：带有指数级退避重试（Exponential Backoff）的 fetch 请求封装
+ * 严格遵循生产级故障复原要求，最大重试 5 次
+ */
+async function fetchWithRetry(url, options, retries = 5, delay = 1000) {
+  try {
+    const response = await fetch(url, options);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    if (retries <= 1) throw error;
+    // 指数级退避延迟计算: 1s, 2s, 4s, 8s, 16s...
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return fetchWithRetry(url, options, retries - 1, delay * 2);
+  }
+}
+
+// ====================================================================
+// 后端 API 路由控制层 (REST APIs)
+// ====================================================================
+
+/**
+ * [API 1] 智能送礼诊断诊断接口 - 驱动：Gemini 2.5 Flash Preview
+ * 采用强类型 JSON Schema 强力约束
+ */
+app.post('/api/gift-recommendation', async (req, res) => {
+  const { relation, age, budget, tags } = req.body;
+
+  // 1. 如果没有 API Key，调用 Mock 推理引擎
+  if (!GEMINI_API_KEY) {
+    console.log("[Mock Engine] 未检测到 API_KEY，启动静态本地推理方案...");
+    return res.json(getMockRecommendations(relation, age, budget, tags));
+  }
+
+  // 2. 构造高精度系统 Prompt 提示词
+  const systemPrompt = "你是一位精通人情世故、懂心理学的高级送礼大师。请根据用户提供的对象关系、年龄阶段、预算、个性和兴趣标签，推荐 3 个极具创意、品味和情感价值的礼物方案。";
+  const userQuery = `送礼对象关系: ${relation}, 年龄段: ${age}, 预算范围: ${budget}元, 对方个性标签: ${tags.join(', ')}。请给出3个具体的礼物方案。`;
+
+  // 3. 构建强类型输出模式 (JSON Schema Constraint)
+  const payload = {
+    contents: [{ parts: [{ text: userQuery }] }],
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          recommendations: {
+            type: "ARRAY",
+            description: "推荐的 3 个专属礼物列表",
+            items: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING", description: "精美的礼品名称" },
+                price: { type: "NUMBER", description: "建议零售价格(数字)" },
+                rationale: { type: "STRING", description: "深情且令人信服的送礼说辞与推荐理由" },
+                imagePrompt: { type: "STRING", description: "用于给生图大模型（例如 Imagen 4）的高清产品宣传渲染图提示词，必须使用英文" },
+                tags: { type: "ARRAY", items: { type: "STRING" }, description: "体现礼品属性的 2-3 个精致短标签" }
+              },
+              required: ["name", "price", "rationale", "imagePrompt", "tags"]
+            }
+          }
+        },
+        required: ["recommendations"]
+      }
+    }
+  };
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
+    const result = await fetchWithRetry(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const textResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!textResponse) {
+      throw new Error("模型响应的 Body 结构体中缺失 Text 数据");
+    }
+
+    // 解析结构化 JSON 并直接返回前端
+    const structuredData = JSON.parse(textResponse);
+    return res.json(structuredData);
+
+  } catch (err) {
+    console.error("[Backend Error] Gemini Recommendation Failed:", err.message);
+    return res.status(500).json({ error: "AI 礼物方案生成失败", details: err.message });
+  }
+});
+
+/**
+ * [API 2] 礼物产品高清渲染生图接口 - 驱动：Imagen 4.0
+ */
+app.post('/api/generate-gift-image', async (req, res) => {
+  const { imagePrompt } = req.body;
+
+  if (!GEMINI_API_KEY) {
+    console.log("[Mock Engine] Imagen 未加载，返回预制渲染图片...");
+    return res.json({ imageUrl: getMockImageUrl(imagePrompt) });
+  }
+
+  const promptText = `High-end luxury commercial product studio shot, studio lighting, highly detailed showcase of ${imagePrompt}, elegant and premium gift packaging, soft focus background, realistic textures, 4k.`;
+  const payload = {
+    instances: [{ prompt: promptText }],
+    parameters: { sampleCount: 1 }
+  };
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${GEMINI_API_KEY}`;
+    const result = await fetchWithRetry(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const base64Bytes = result.predictions?.[0]?.bytesBase64Encoded;
+    if (!base64Bytes) {
+      throw new Error("Imagen 4.0 接口未返回有效的图像字节流数据");
+    }
+
+    return res.json({ imageUrl: `data:image/png;base64,${base64Bytes}` });
+
+  } catch (err) {
+    console.error("[Backend Error] Imagen 4.0 Generation Failed:", err.message);
+    return res.status(500).json({ error: "AI 实物渲染图生图失败", details: err.message });
+  }
+});
+
+/**
+ * [API 3] 原生语音贺卡卡片配音接口 - 驱动：Gemini 2.5 TTS
+ * 返回 16-bit 原始 PCM 音频流
+ */
+app.post('/api/generate-tts-greeting', async (req, res) => {
+  const { text, tone = "warm" } = req.body;
+
+  if (!GEMINI_API_KEY) {
+    console.log("[Mock Engine] 未检测到 API_KEY，跳过 TTS 生成。");
+    return res.status(404).json({ error: "本地未注入 API Key，声音生成需云端支撑。请注入环境变量。" });
+  }
+
+  // 针对不同语气选择不同的专业配音播报员
+  const speakerVoice = tone === "warm" ? "Kore" : tone === "romantic" ? "Leda" : "Zephyr";
+  
+  const payload = {
+    contents: [{ parts: [{ text: `用深情温暖、极具磁性、富有情感的男低音帮我朗读以下这段送给亲友的礼物贺卡祝福，语速要慢，富于停顿和真挚：\n${text}` }] }],
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: {
+            voiceName: speakerVoice
+          }
+        }
+      }
+    },
+    model: "gemini-2.5-flash-preview-tts"
+  };
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${GEMINI_API_KEY}`;
+    const result = await fetchWithRetry(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const base64Audio = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const mimeType = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.mimeType || "audio/L16;rate=24000";
+    
+    if (!base64Audio) {
+      throw new Error("TTS 接口未返回有效的音频数据内容");
+    }
+
+    return res.json({ 
+      audioData: base64Audio, 
+      mimeType: mimeType 
+    });
+
+  } catch (err) {
+    console.error("[Backend Error] Gemini TTS Generation Failed:", err.message);
+    return res.status(500).json({ error: "AI 语音贺卡生成失败", details: err.message });
+  }
+});
+
+
+// ====================================================================
+// 系统降级本地容灾引擎 (Mock Engine Data)
+// ====================================================================
+
+function getMockRecommendations(relation, age, budget, tags) {
+  console.log(`[Mock Engine] 匹配规则：对象【${relation}】，年龄【${age}】，预算【${budget}】`);
+  return {
+    recommendations: [
+      {
+        name: `${tags[0] || "创意"}时光浮雕光影音箱`,
+        price: Math.min(Math.max(Math.floor(budget * 0.8), 120), budget),
+        rationale: `针对【${relation}】的个性和品味量身定制。将定制的黑胶唱片浮雕与氛围呼吸灯无缝融合。这不仅是一台拥有 HIFI 级饱满音质的蓝牙音箱，更是一个温润、在黑夜中守护TA的艺术氛围灯。每次音乐响起，都是你心意的流动。`,
+        imagePrompt: `A luxury modern ambient speaker with visual glowing light waves on its wooden surface, minimal lifestyle background, elegant gift wrap, professional product photography.`,
+        tags: ["声学美学", "实用艺术", "深夜陪伴"]
+      },
+      {
+        name: `${tags[1] || "小资"}流光极光香薰疗愈睡眠仪`,
+        price: Math.min(Math.max(Math.floor(budget * 0.6), 88), budget),
+        rationale: `生活节奏忙碌，这一款结合了阿尔卑斯颂钵疗愈音效、1600万色流光变幻和顶级天然精油超声波冷喷的助眠伴侣，能够让【${relation}】在每个疲惫的深夜都感受到被温柔拥抱着入睡。是绝不出错的贴心和体贴之选。`,
+        imagePrompt: `An exquisite luxury glass aroma diffuser releasing soft fine mist, glowing inside with cozy soft warm light, standing on a marble nightstand next to lavender elements, dynamic studio layout.`,
+        tags: ["解压疗愈", "舒缓助眠", "奢华设计"]
+      },
+      {
+        name: "定制时光轨迹星空指纹雕刻戒指",
+        price: Math.min(Math.max(Math.floor(budget * 0.9), 199), budget),
+        rationale: `代表永恒的时间轨迹。我们可以将你们的特定纪念日星空轨迹（例如第一次见面的夜晚星图）激光微雕刻入钛钢戒指。简约而不失厚重，象征着无微不至的专属珍贵。`,
+        imagePrompt: `Two premium titanium steel luxury wedding rings with cosmic star map patterns delicately laser-engraved, laying inside a custom dark velvet jewelry gift box, macro lens photography.`,
+        tags: ["独一无二", "极简美学", "纪念礼赞"]
+      }
+    ]
+  };
+}
+
+function getMockImageUrl(imagePrompt) {
+  // 随机提供几款高质感、无任何占位文字的高保真礼物渲染插图
+  const mockImages = [
+    "https://images.unsplash.com/photo-1549465220-1a8b9238cd48?auto=format&fit=crop&q=80&w=600", // 精致礼盒
+    "https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&q=80&w=600", // 极简智能水杯
+    "https://images.unsplash.com/photo-1608571423902-eed4a5ad8108?auto=format&fit=crop&q=80&w=600", // 高端香水
+    "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&q=80&w=600"  // 专业耳机音箱
+  ];
+  return mockImages[Math.floor(Math.random() * mockImages.length)];
+}
+
+
+// ====================================================================
+// 前端静态页面全页面输出控制层 (HTML + CSS + React SPA)
+// ====================================================================
+
+app.get('/', (req, res) => {
+  res.send(`
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 送礼大师 GiftyAI - 极客级全栈电商应用演示</title>
+  
+  <!-- 引入现代前端基础设施依赖 -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- 引入奢华质感字体和基础样式设定 -->
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+  
+  <style>
+    body {
+      font-family: 'Plus Jakarta Sans', 'Noto Sans SC', sans-serif;
+      background: radial-gradient(circle at 50% 50%, #11131a 0%, #08090d 100%);
+      color: #f1f5f9;
+      overflow-x: hidden;
+    }
+    /* 自定义流动渐变条 */
+    .flow-border {
+      position: relative;
+    }
+    .flow-border::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: inherit;
+      padding: 1px;
+      background: linear-gradient(to right, #4f46e5, #06b6d4, #ec4899);
+      -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+      pointer-events: none;
+    }
+    /* 仿原生 iOS 隐藏滚动条 */
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center py-10 px-4">
+
+  <!-- React 挂载根节点 -->
+  <div id="root"></div>
+
+  <!-- 💡 主前端逻辑块 -->
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ====================================================================
+    // 前端二进制工具函数 (PCM 字节流打包 WAV 格式)
+    // ====================================================================
+    function convertPCMToWavBlob(base64PCM, sampleRate = 24000, numChannels = 1, bitsPerSample = 16) {
+      // 1. 将 Base64 解码为二进制 ArrayBuffer
+      const binaryString = window.atob(base64PCM);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      
+      const buffer = bytes.buffer;
+      const wavHeaderBuffer = new ArrayBuffer(44);
+      const view = new DataView(wavHeaderBuffer);
+      
+      /* RIFF 标识符 */
+      writeString(view, 0, 'RIFF');
+      /* 文件总大小 = 音频数据长度 + (44字节头部 - 8字节前缀占位) */
+      view.setUint32(4, 36 + buffer.byteLength, true);
+      /* WAVE 标识符 */
+      writeString(view, 8, 'WAVE');
+      /* Format Chunk 标识符 */
+      writeString(view, 12, 'fmt ');
+      /* Subchunk1Size = 16 (线性PCM格式) */
+      view.setUint32(16, 16, true);
+      /* AudioFormat = 1 (Linear PCM) */
+      view.setUint16(20, 1, true);
+      /* 声道数 (Mono = 1) */
+      view.setUint16(22, numChannels, true);
+      /* 采样率 (例如 24000Hz) */
+      view.setUint32(24, sampleRate, true);
+      /* ByteRate = SampleRate * NumChannels * BitsPerSample/8 */
+      view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
+      /* BlockAlign = NumChannels * BitsPerSample/8 */
+      view.setUint16(32, numChannels * (bitsPerSample / 8), true);
+      /* BitsPerSample = 16位 */
+      view.setUint16(34, bitsPerSample, true);
+      /* Data Chunk 标识符 */
+      writeString(view, 36, 'data');
+      /* Subchunk2Size (数据总长度) */
+      view.setUint32(40, buffer.byteLength, true);
+      
+      // 合并 44字节 WAV 头文件和原始音频原始数据
+      const combinedBlob = new Blob([wavHeaderBuffer, buffer], { type: 'audio/wav' });
+      return URL.createObjectURL(combinedBlob);
+    }
+
+    function writeString(view, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+
+    // ====================================================================
+    // 基础静态数据 (精选货架常规现货商品)
+    // ====================================================================
+    const INSTANT_PRODUCTS = [
+      {
+        id: "p1",
+        name: "Maison Margiela 经典微醺爵士香氛 100ml",
+        price: 980,
+        image: "https://images.unsplash.com/photo-1547887537-6158d64c35b3?auto=format&fit=crop&q=80&w=400",
+        desc: "微醺朗姆酒与淡淡烟草香调，诠释迷离慵懒的经典绅士品味。",
+        tag: "浪漫浪漫"
+      },
+      {
+        id: "p2",
+        name: "Lladro 纯白哑光陶瓷手作天使烛台",
+        price: 1560,
+        image: "https://images.unsplash.com/photo-1603006905003-be475563bc59?auto=format&fit=crop&q=80&w=400",
+        desc: "西班牙百年工艺手作，圣洁优雅，传递深夜的安静陪伴。",
+        tag: "古典奢华"
+      },
+      {
+        id: "p3",
+        name: "Baccarat 水晶极光几何威士忌对杯",
+        price: 2480,
+        image: "https://images.unsplash.com/photo-1514362545857-3bc16c4c7d1b?auto=format&fit=crop&q=80&w=400",
+        desc: "晶莹剔透的水晶在光照下折射出极光般的迷人斑斓斑斓。",
+        tag: "格调奢华"
+      }
+    ];
+
+    // ====================================================================
+    // 主 React 应用程序组件
+    // ====================================================================
+    function App() {
+      // 导航核心状态机：'home' | 'wizard' | 'recommendations' | 'cart' | 'checkout' | 'order-success'
+      const [page, setPage] = useState('home');
+      
+      // 送礼诊断问卷状态
+      const [relation, setRelation] = useState('恋人');
+      const [age, setAge] = useState('20-30岁');
+      const [budget, setBudget] = useState(300);
+      const [selectedTags, setSelectedTags] = useState(['小资浪漫', '独特创意']);
+      
+      // API 生成的中间层状态
+      const [loading, setLoading] = useState(false);
+      const [isGeneratingImg, setIsGeneratingImg] = useState({});
+      const [isGeneratingTts, setIsGeneratingTts] = useState({});
+      const [aiRecommendations, setAiRecommendations] = useState([]);
+      const [currentImageUrls, setCurrentImageUrls] = useState({});
+      const [ttsAudioUrls, setTtsAudioUrls] = useState({});
+      
+      // 全局业务状态：购物车 & 最新订单
+      const [cart, setCart] = useState([]);
+      const [latestOrder, setLatestOrder] = useState(null);
+      
+      // 全局轻量 UI 状态：灵动岛(Dynamic Island)、自定义提示 Toast
+      const [islandMsg, setIslandMsg] = useState(null);
+      const [toast, setToast] = useState(null);
+      
+      // 贺卡卡片定制暂存状态
+      const [selectedGiftOption, setSelectedGiftOption] = useState(null);
+      const [cardMessage, setCardMessage] = useState("");
+      const [customTone, setCustomTone] = useState("warm");
+      const [needLuxuryBox, setNeedLuxuryBox] = useState(true);
+      const [needAudioQR, setNeedAudioQR] = useState(true);
+
+      // 音频播放控制引用
+      const audioRef = useRef(null);
+      const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+
+      // 初始化 Lucide 图标集
+      useEffect(() => {
+        if (window.lucide) {
+          window.lucide.createIcons();
+        }
+      }, [page, aiRecommendations, loading]);
+
+      // 辅助方法：触发全景灵动岛通知
+      const triggerIsland = (title, subtitle) => {
+        setIslandMsg({ title, subtitle });
+        setTimeout(() => setIslandMsg(null), 4000);
+      };
+
+      // 辅助方法：弹出 Toast
+      const showToast = (message) => {
+        setToast(message);
+        setTimeout(() => setToast(null), 3000);
+      };
+
+      // 1. 调用后端接口：生成 AI 送礼诊断方案
+      const handleGenerateRecommendations = async () => {
+        setLoading(true);
+        setPage('wizard');
+        try {
+          const res = await fetch('/api/gift-recommendation', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              relation,
+              age,
+              budget,
+              tags: selectedTags
+            })
+          });
+          const data = await res.json();
+          if (data.recommendations) {
+            setAiRecommendations(data.recommendations);
+            // 默认清空旧生图和TTS数据
+            setCurrentImageUrls({});
+            setTtsAudioUrls({});
+            setPage('recommendations');
+            triggerIsland("💡 灵感生成成功!", `已量身定制 3 个高端创意方案`);
+          } else {
+            showToast("生成方案格式不正确，请重试");
+          }
+        } catch (err) {
+          showToast(`接口出错: ${err.message}`);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // 2. 调用后端接口：异步生成礼物高清渲染图 (Imagen 4.0)
+      const handleGenerateImage = async (index, imagePrompt) => {
+        setIsGeneratingImg(prev => ({ ...prev, [index]: true }));
+        try {
+          const res = await fetch('/api/generate-gift-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ imagePrompt })
+          });
+          const data = await res.json();
+          if (data.imageUrl) {
+            setCurrentImageUrls(prev => ({ ...prev, [index]: data.imageUrl }));
+            triggerIsland("🎨 Imagen 渲染完毕", "AI 精细打光渲染产品图就绪");
+          }
+        } catch (err) {
+          showToast(`图画渲染出错: ${err.message}`);
+        } finally {
+          setIsGeneratingImg(prev => ({ ...prev, [index]: false }));
+        }
+      };
+
+      // 3. 调用后端接口：异步生成 TTS 原生声音贺卡 (Gemini TTS ➔ 前端 WAV 转码)
+      const handleGenerateAudioCard = async (index, name, text) => {
+        setIsGeneratingTts(prev => ({ ...prev, [index]: true }));
+        try {
+          const greetingText = text || `送给最亲爱的：${name}。愿这件精致的小物能在未来的每一个静谧深夜伴你身旁，祝你幸福常在。`;
+          const res = await fetch('/api/generate-tts-greeting', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: greetingText, tone: customTone })
+          });
+          
+          if (!res.ok) {
+            const errData = await res.json();
+            throw new Error(errData.error || "生成失败");
+          }
+
+          const data = await res.json();
+          if (data.audioData) {
+            // 【核心吹点】：前端无依赖直接打包 16-bit PCM 二进制数组为标准 WAV 容器
+            const wavUrl = convertPCMToWavBlob(data.audioData, 24000);
+            setTtsAudioUrls(prev => ({ ...prev, [index]: wavUrl }));
+            triggerIsland("🎙️ 语音合成成功", "44字节头原生WAV转码打包完成");
+          }
+        } catch (err) {
+          showToast(`配音功能不可用: ${err.message}`);
+        } finally {
+          setIsGeneratingTts(prev => ({ ...prev, [index]: false }));
+        }
+      };
+
+      // 播放/暂停控制
+      const togglePlayAudio = (url) => {
+        if (!audioRef.current) {
+          audioRef.current = new Audio(url);
+          audioRef.current.onended = () => setIsPlayingAudio(false);
+        } else if (audioRef.current.src !== url) {
+          audioRef.current.pause();
+          audioRef.current = new Audio(url);
+          audioRef.current.onended = () => setIsPlayingAudio(false);
+        }
+
+        if (isPlayingAudio) {
+          audioRef.current.pause();
+          setIsPlayingAudio(false);
+        } else {
+          audioRef.current.play();
+          setIsPlayingAudio(true);
+        }
+      };
+
+      // 4. 将 AI 深度定制化商品放入购物车，秒速切换到结账流程 (SKU Payload 装配)
+      const handleSelectToCheckout = (gift, index) => {
+        const customizedItem = {
+          id: `ai-${Date.now()}`,
+          name: gift.name,
+          price: gift.price,
+          image: currentImageUrls[index] || "https://images.unsplash.com/photo-1549465220-1a8b9238cd48?auto=format&fit=crop&q=80&w=400",
+          isAiCustom: true,
+          rationale: gift.rationale,
+          audioUrl: ttsAudioUrls[index] || null,
+          cardMsg: cardMessage || "见字如面，展信佳。",
+          options: {
+            luxuryBox: needLuxuryBox,
+            audioQR: needAudioQR
+          }
+        };
+
+        setCart([customizedItem]); // 覆盖常规购物车快速买单
+        setPage('checkout');
+        triggerIsland("🛒 方案装配就绪", "正携带定制 SKU 载入安全收银台");
+      };
+
+      // 常规商品直接添加购物车
+      const handleAddNormalProductToCart = (product) => {
+        const cartItem = {
+          id: `normal-${Date.now()}`,
+          name: product.name,
+          price: product.price,
+          image: product.image,
+          isAiCustom: false,
+          desc: product.desc
+        };
+        setCart(prev => [...prev, cartItem]);
+        triggerIsland("🛒 已加购", product.name);
+      };
+
+      // 5. 模拟安全支付流程
+      const handlePayOrder = () => {
+        if (cart.length === 0) return;
+        
+        setLoading(true);
+        setTimeout(() => {
+          setLoading(false);
+          const mockOrder = {
+            orderId: `GF-${Math.floor(100000 + Math.random() * 900000)}`,
+            items: [...cart],
+            totalAmount: cart.reduce((sum, item) => sum + item.price, 0) + (needLuxuryBox ? 68 : 0),
+            date: new Date().toLocaleString('zh-CN'),
+            trackingStatus: "仓库正极速打包...",
+            voiceCardUrl: cart[0]?.audioUrl || null
+          };
+          setLatestOrder(mockOrder);
+          setCart([]);
+          setPage('order-success');
+          triggerIsland("✨ 支付完成", `订单：${mockOrder.orderId} 开始配送`);
+        }, 2000);
+      };
+
+      // 多选标签控制器
+      const toggleTag = (tag) => {
+        if (selectedTags.includes(tag)) {
+          setSelectedTags(prev => prev.filter(t => t !== tag));
+        } else {
+          setSelectedTags(prev => [...prev, tag]);
+        }
+      };
+
+      return (
+        <div className="w-[390px] h-[844px] bg-[#0c0d12] rounded-[50px] shadow-[0_25px_60px_rgba(0,0,0,0.8)] border-[8px] border-[#222431] overflow-hidden relative flex flex-col">
+          
+          {/* ========================================== */}
+          {/* 仿真手机顶部状态栏 */}
+          {/* ========================================== */}
+          <div className="h-11 bg-[#0c0d12] flex items-center justify-between px-6 select-none z-50">
+            <span className="text-[12px] font-semibold text-slate-300">15:26</span>
+            
+            {/* 灵动岛 (Dynamic Island) 弹性渲染层 */}
+            <div className={`absolute top-2 left-1/2 -translate-x-1/2 bg-black rounded-3xl flex items-center transition-all duration-500 ease-out z-50 shadow-lg ${
+              islandMsg ? 'w-[320px] py-2 px-4 border border-indigo-500/20' : 'w-[110px] h-[26px]'
+            }`}>
+              {islandMsg ? (
+                <div className="flex items-center space-x-3 w-full">
+                  <div className="w-8 h-8 rounded-full bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center animate-pulse">
+                    <i data-lucide="sparkles" className="w-4 h-4 text-cyan-400"></i>
+                  </div>
+                  <div className="flex-1 text-left">
+                    <p className="text-[11px] font-bold text-white leading-tight">{islandMsg.title}</p>
+                    <p className="text-[9px] text-slate-400 truncate leading-tight mt-0.5">{islandMsg.subtitle}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="w-full flex items-center justify-center space-x-1">
+                  <div className="w-2 h-2 rounded-full bg-slate-800"></div>
+                  <div className="w-[10px] h-[10px] rounded-full bg-[#111] border border-slate-900"></div>
+                </div>
+              )}
+            </div>
+
+            {/* 状态图标 */}
+            <div className="flex items-center space-x-1.5 text-slate-300">
+              <i data-lucide="signal" className="w-3.5 h-3.5"></i>
+              <i data-lucide="wifi" className="w-3.5 h-3.5"></i>
+              <div className="w-5 h-2.5 border border-slate-300 rounded-sm p-[1px] flex items-center">
+                <div className="h-full w-4 bg-slate-300 rounded-2xs"></div>
+              </div>
+            </div>
+          </div>
+
+          {/* ========================================== */}
+          {/* 系统加载 Loading 蒙层 */}
+          {/* ========================================== */}
+          {loading && (
+            <div className="absolute inset-0 bg-black/90 z-50 flex flex-col items-center justify-center space-y-4">
+              <div className="w-12 h-12 rounded-full border-4 border-indigo-600/20 border-t-indigo-500 animate-spin"></div>
+              <p className="text-[13px] text-indigo-400 tracking-wider font-semibold animate-pulse">AI 深度推理转译中...</p>
+            </div>
+          )}
+
+          {/* ========================================== */}
+          {/* Toast 提示框 */}
+          {/* ========================================== */}
+          {toast && (
+            <div className="absolute top-16 left-4 right-4 bg-slate-900 border border-red-500/20 py-2.5 px-4 rounded-xl z-50 text-[11px] text-red-300 flex items-center space-x-2 animate-bounce">
+              <i data-lucide="info" className="w-4 h-4 text-red-400 shrink-0"></i>
+              <span className="truncate">{toast}</span>
+            </div>
+          )}
+
+          {/* ========================================== */}
+          {/* 主体滚动视图区域 */}
+          {/* ========================================== */}
+          <div className="flex-1 overflow-y-auto no-scrollbar pb-16">
+            
+            {/* 1. 首页 (Home Screen) */}
+            {page === 'home' && (
+              <div className="px-5 py-2 animate-fadeIn">
+                <div className="flex items-center justify-between mb-4 mt-2">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-indigo-500 to-pink-500 flex items-center justify-center">
+                      <i data-lucide="gift" className="w-4 h-4 text-white"></i>
+                    </div>
+                    <span className="text-sm font-bold tracking-wider text-slate-100">GiftyAI 臻选阁</span>
+                  </div>
+                  <div className="relative cursor-pointer" onClick={() => setPage('cart')}>
+                    <i data-lucide="shopping-cart" className="w-5 h-5 text-slate-400 hover:text-white"></i>
+                    {cart.length > 0 && (
+                      <span className="absolute -top-1.5 -right-1.5 bg-indigo-500 text-[9px] text-white w-4 h-4 rounded-full flex items-center justify-center font-bold">
+                        {cart.length}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* AI 灵感大师巨幅广告板 */}
+                <div className="flow-border rounded-2xl bg-gradient-to-br from-indigo-950/40 via-purple-950/20 to-[#0e1017] p-5 mb-6 relative overflow-hidden mt-3">
+                  <div className="absolute -right-10 -bottom-10 w-32 h-32 bg-indigo-500/10 rounded-full blur-2xl"></div>
+                  <div className="flex items-center space-x-2 text-cyan-400 text-[10px] font-bold uppercase tracking-wider mb-1">
+                    <i data-lucide="sparkles" className="w-3 h-3"></i>
+                    <span>Gemini 3.5 & Imagen 4</span>
+                  </div>
+                  <h3 className="text-lg font-bold text-white mb-1.5 leading-tight">送礼焦虑症？</h3>
+                  <p className="text-[11px] text-slate-400 mb-4 leading-relaxed">
+                    输入 TA 的多维立体画像，模型一键深度诊断并生成专属高端创意礼物及 AI 温暖贺卡配音。
+                  </p>
+                  <button 
+                    onClick={() => setPage('wizard')}
+                    className="w-full py-2.5 bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:to-pink-500 text-[12px] font-bold text-white rounded-xl shadow-[0_4px_15px_rgba(99,102,241,0.3)] transition-transform active:scale-95 flex items-center justify-center space-x-1.5"
+                  >
+                    <span>开启 AI 送礼诊断</span>
+                    <i data-lucide="arrow-right" className="w-3.5 h-3.5"></i>
+                  </button>
+                </div>
+
+                {/* 现货商品好物架 */}
+                <div className="mb-6">
+                  <div className="flex items-center justify-between mb-3">
+                    <h4 className="text-[12px] font-bold text-slate-400 uppercase tracking-wider">现货尊享特区</h4>
+                    <span className="text-[10px] text-slate-600">全场保真</span>
+                  </div>
+                  
+                  <div className="space-y-4">
+                    {INSTANT_PRODUCTS.map((prod) => (
+                      <div key={prod.id} className="bg-[#11131c] rounded-xl p-3 flex space-x-3 border border-slate-900 hover:border-slate-800 transition-colors">
+                        <img src={prod.image} className="w-20 h-20 rounded-lg object-cover bg-slate-950 shrink-0" alt={prod.name} />
+                        <div className="flex-1 flex flex-col justify-between">
+                          <div>
+                            <span className="text-[9px] bg-slate-800 text-slate-300 py-0.5 px-2 rounded-full font-medium">{prod.tag}</span>
+                            <h5 className="text-[12px] font-bold text-white mt-1 leading-tight">{prod.name}</h5>
+                            <p className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">{prod.desc}</p>
+                          </div>
+                          <div className="flex items-center justify-between mt-2">
+                            <span className="text-[13px] font-bold text-slate-100">¥{prod.price}</span>
+                            <button 
+                              onClick={() => handleAddNormalProductToCart(prod)}
+                              className="py-1 px-3 bg-slate-800 hover:bg-slate-700 text-[10px] text-indigo-400 rounded-lg flex items-center space-x-1"
+                            >
+                              <i data-lucide="shopping-bag" className="w-3 h-3"></i>
+                              <span>加购</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 2. 送礼画像配置器 (AI Wizard Screen) */}
+            {page === 'wizard' && (
+              <div className="px-5 py-4 animate-fadeIn">
+                <div className="flex items-center justify-between mb-5">
+                  <button onClick={() => setPage('home')} className="p-1 text-slate-400 hover:text-white">
+                    <i data-lucide="chevron-left" className="w-6 h-6"></i>
+                  </button>
+                  <span className="text-sm font-bold text-slate-200">AI 多维送礼画像</span>
+                  <div className="w-8"></div>
+                </div>
+
+                <div className="space-y-5">
+                  {/* 收件人关系 */}
+                  <div>
+                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest block mb-2">1. TA 是你的谁？</label>
+                    <div className="grid grid-cols-4 gap-2">
+                      {['恋人', '死党', '长辈', '客户'].map((rel) => (
+                        <button
+                          key={rel}
+                          onClick={() => setRelation(rel)}
+                          className={`py-2 text-[11px] rounded-lg border transition-all ${
+                            relation === rel 
+                              ? 'bg-indigo-600/20 border-indigo-500 text-white font-bold' 
+                              : 'bg-[#11131c] border-slate-900 text-slate-400 hover:border-slate-800'
+                          }`}
+                        >
+                          {rel}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 年龄阶段 */}
+                  <div>
+                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest block mb-2">2. TA 的年龄阶段</label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {['18-25岁', '26-35岁', '36岁以上'].map((a) => (
+                        <button
+                          key={a}
+                          onClick={() => setAge(a)}
+                          className={`py-2 text-[11px] rounded-lg border transition-all ${
+                            age === a 
+                              ? 'bg-indigo-600/20 border-indigo-500 text-white font-bold' 
+                              : 'bg-[#11131c] border-slate-900 text-slate-400 hover:border-slate-800'
+                          }`}
+                        >
+                          {a}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 礼物最高预算 */}
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">3. 最高预算上限</label>
+                      <span className="text-[12px] font-bold text-indigo-400">¥ {budget}</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="100" 
+                      max="3000" 
+                      step="50"
+                      value={budget}
+                      onChange={(e) => setBudget(parseInt(e.target.value))}
+                      className="w-full accent-indigo-500" 
+                    />
+                    <div className="flex justify-between text-[10px] text-slate-600 mt-1">
+                      <span>¥100</span>
+                      <span>¥3000</span>
+                    </div>
+                  </div>
+
+                  {/* 对方个性与属性标签 */}
+                  <div>
+                    <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest block mb-2">4. TA 的个性特质 (多选)</label>
+                    <div className="flex flex-wrap gap-2">
+                      {['小资浪漫', '独特创意', '科技极客', '务实极简', '时尚前卫', '养生健康'].map((tag) => {
+                        const active = selectedTags.includes(tag);
+                        return (
+                          <button
+                            key={tag}
+                            onClick={() => toggleTag(tag)}
+                            className={`py-1.5 px-3 text-[10px] rounded-full border transition-all ${
+                              active 
+                                ? 'bg-gradient-to-r from-indigo-600 to-purple-600 border-indigo-500 text-white font-bold' 
+                                : 'bg-[#11131c] border-slate-900 text-slate-400 hover:border-slate-800'
+                            }`}
+                          >
+                            {tag}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* 提交按钮 */}
+                  <div className="pt-4">
+                    <button
+                      onClick={handleGenerateRecommendations}
+                      className="w-full py-3 bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:opacity-95 text-[12px] font-bold text-white rounded-xl shadow-[0_4px_20px_rgba(99,102,241,0.3)] transition-transform active:scale-95 flex items-center justify-center space-x-2"
+                    >
+                      <i data-lucide="cpu" className="w-4 h-4"></i>
+                      <span>AI 引擎深度诊断方案</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* 3. 诊断方案推荐视图 (AI Recommendations Screen) */}
+            {page === 'recommendations' && (
+              <div className="px-5 py-4 animate-fadeIn">
+                <div className="flex items-center justify-between mb-4">
+                  <button onClick={() => setPage('wizard')} className="p-1 text-slate-400 hover:text-white">
+                    <i data-lucide="chevron-left" className="w-6 h-6"></i>
+                  </button>
+                  <span className="text-sm font-bold text-slate-200">AI 推荐礼品清单</span>
+                  <div className="w-8"></div>
+                </div>
+
+                <div className="space-y-6">
+                  {aiRecommendations.map((gift, idx) => {
+                    const hasImage = currentImageUrls[idx];
+                    const isImgLoading = isGeneratingImg[idx];
+                    const hasAudio = ttsAudioUrls[idx];
+                    const isAudioLoading = isGeneratingTts[idx];
+
+                    return (
+                      <div key={idx} className="bg-[#11131c] rounded-2xl p-4 border border-slate-900/60 relative overflow-hidden">
+                        
+                        {/* 渲染产品图片展示区 */}
+                        <div className="w-full h-44 bg-slate-950 rounded-xl mb-3 overflow-hidden relative flex items-center justify-center group border border-slate-900">
+                          {hasImage ? (
+                            <img src={currentImageUrls[idx]} className="w-full h-full object-cover" alt={gift.name} />
+                          ) : (
+                            <div className="text-center p-4">
+                              <i data-lucide="image" className="w-8 h-8 text-slate-700 mx-auto mb-2"></i>
+                              <p className="text-[10px] text-slate-500 mb-2">Imagen 4.0 未加载</p>
+                              <button
+                                onClick={() => handleGenerateImage(idx, gift.imagePrompt)}
+                                disabled={isImgLoading}
+                                className="py-1 px-3 bg-indigo-600/10 hover:bg-indigo-600/20 border border-indigo-500/20 text-[10px] text-indigo-400 rounded-lg transition-transform active:scale-95"
+                              >
+                                {isImgLoading ? 'AI 正在极速渲染...' : '生成 AI 实物图'}
+                              </button>
+                            </div>
+                          )}
+                          
+                          {/* 渲染覆盖渐变 */}
+                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
+                          
+                          {/* 售价展示 */}
+                          <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
+                            <span className="text-[10px] bg-indigo-500 text-white font-bold px-2 py-0.5 rounded-md">AI 创意推荐</span>
+                            <span className="text-[14px] font-extrabold text-white">¥{gift.price}</span>
+                          </div>
+                        </div>
+
+                        {/* 文字内容 */}
+                        <div>
+                          <div className="flex items-center space-x-1.5 mb-1.5">
+                            {gift.tags.map((tg, tIdx) => (
+                              <span key={tIdx} className="text-[9px] bg-slate-800 text-slate-300 py-0.5 px-2 rounded-md">{tg}</span>
+                            ))}
+                          </div>
+                          <h4 className="text-[13px] font-bold text-white mb-1">{gift.name}</h4>
+                          <p className="text-[10px] text-slate-400 leading-relaxed text-justify mb-4">{gift.rationale}</p>
+                        </div>
+
+                        {/* 原生声音贺卡模块 (TTS Interactivity) */}
+                        <div className="bg-[#090a0f] border border-slate-900 rounded-xl p-3 mb-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <div className="flex items-center space-x-1.5">
+                              <i data-lucide="mic" className="w-3.5 h-3.5 text-pink-400"></i>
+                              <span className="text-[10px] font-bold text-pink-400">AI 原生声音贺卡</span>
+                            </div>
+                            
+                            <select 
+                              value={customTone}
+                              onChange={(e) => setCustomTone(e.target.value)}
+                              className="bg-slate-900 border border-slate-800 text-[9px] text-slate-400 rounded px-1.5 py-0.5 focus:outline-none"
+                            >
+                              <option value="warm">温暖男声 (Kore)</option>
+                              <option value="romantic">浪漫女声 (Leda)</option>
+                            </select>
+                          </div>
+
+                          {hasAudio ? (
+                            <div className="flex items-center justify-between bg-indigo-950/20 rounded-lg p-2 border border-indigo-500/10">
+                              <div className="flex items-center space-x-2">
+                                <button 
+                                  onClick={() => togglePlayAudio(ttsAudioUrls[idx])}
+                                  className="w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center transition-transform active:scale-95"
+                                >
+                                  <i data-lucide={isPlayingAudio ? "pause" : "play"} className="w-3.5 h-3.5"></i>
+                                </button>
+                                <span className="text-[9px] text-slate-400">点击播放温暖音箱祝福...</span>
+                              </div>
+                              <div className="flex space-x-0.5">
+                                {[1, 2, 3, 4, 5].map((bar) => (
+                                  <div key={bar} className={`w-0.5 h-3 bg-indigo-400 rounded-full ${isPlayingAudio ? 'animate-pulse' : ''}`} style={{ animationDelay: `${bar * 150}ms` }}></div>
+                                ))}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-between">
+                              <span className="text-[9px] text-slate-500">将文字贺卡转换为温暖的原声朗读</span>
+                              <button
+                                onClick={() => handleGenerateAudioCard(idx, relation, gift.rationale)}
+                                disabled={isAudioLoading}
+                                className="py-1 px-2.5 bg-pink-600/10 hover:bg-pink-600/20 border border-pink-500/20 text-[9px] text-pink-400 rounded-lg"
+                              >
+                                {isAudioLoading ? '合成中...' : '生成声音卡片'}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 一键下单转码转换 */}
+                        <div className="flex items-center space-x-2 pt-2 border-t border-slate-900">
+                          <button 
+                            onClick={() => handleSelectToCheckout(gift, idx)}
+                            className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 text-[11px] font-bold text-white rounded-xl text-center active:scale-95 transition-transform"
+                          >
+                            选择此方案去结算
+                          </button>
+                        </div>
+
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 4. 购物车 (Cart Screen) */}
+            {page === 'cart' && (
+              <div className="px-5 py-4 animate-fadeIn">
+                <div className="flex items-center justify-between mb-5">
+                  <button onClick={() => setPage('home')} className="p-1 text-slate-400 hover:text-white">
+                    <i data-lucide="chevron-left" className="w-6 h-6"></i>
+                  </button>
+                  <span className="text-sm font-bold text-slate-200">购物车 ({cart.length})</span>
+                  <button onClick={() => setCart([])} className="text-[10px] text-slate-500 hover:text-slate-300">清空</button>
+                </div>
+
+                {cart.length === 0 ? (
+                  <div className="text-center py-20">
+                    <i data-lucide="shopping-cart" className="w-12 h-12 text-slate-700 mx-auto mb-3"></i>
+                    <p className="text-xs text-slate-500">购物车内没有任何商品</p>
+                    <button onClick={() => setPage('home')} className="mt-4 text-[11px] text-indigo-400 underline">返回尊享特区</button>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {cart.map((item) => (
+                      <div key={item.id} className="bg-[#11131c] rounded-xl p-3 flex space-x-3 border border-slate-900">
+                        <img src={item.image} className="w-16 h-16 rounded-lg object-cover" />
+                        <div className="flex-1 flex flex-col justify-between">
+                          <div>
+                            <h5 className="text-[12px] font-bold text-white leading-tight">{item.name}</h5>
+                            <p className="text-[10px] text-slate-500 line-clamp-1 mt-0.5">
+                              {item.isAiCustom ? 'AI 专属高定配置' : item.desc}
+                            </p>
+                          </div>
+                          <div className="flex items-center justify-between mt-2">
+                            <span className="text-[12px] font-bold text-white">¥{item.price}</span>
+                            <span className="text-[10px] text-slate-500">数量：1</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+
+                    <div className="mt-6 pt-4 border-t border-slate-900 space-y-2">
+                      <div className="flex justify-between text-[11px] text-slate-400">
+                        <span>小计</span>
+                        <span>¥{cart.reduce((s, i) => s + i.price, 0)}</span>
+                      </div>
+                      <div className="flex justify-between text-sm font-bold text-white">
+                        <span>总额</span>
+                        <span>¥{cart.reduce((s, i) => s + i.price, 0)}</span>
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => setPage('checkout')}
+                      className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-[12px] font-bold text-white rounded-xl text-center shadow-lg active:scale-95 transition-transform mt-4"
+                    >
+                      进入收银台
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 5. 结账收银台 (Checkout Screen) */}
+            {page === 'checkout' && (
+              <div className="px-5 py-4 animate-fadeIn">
+                <div className="flex items-center justify-between mb-5">
+                  <button onClick={() => setPage('cart')} className="p-1 text-slate-400 hover:text-white">
+                    <i data-lucide="chevron-left" className="w-6 h-6"></i>
+                  </button>
+                  <span className="text-sm font-bold text-slate-200">安全结账台</span>
+                  <div className="w-8"></div>
+                </div>
+
+                <div className="space-y-4">
+                  
+                  {/* 配送地址 */}
+                  <div className="bg-[#11131c] rounded-xl p-3 border border-slate-900">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] font-bold text-slate-500 tracking-wider">默认收件地址</span>
+                      <span className="text-[9px] text-indigo-400">修改</span>
+                    </div>
+                    <div className="flex items-start space-x-2">
+                      <i data-lucide="map-pin" className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5"></i>
+                      <div>
+                        <p className="text-[11px] font-bold text-white">李华 138****9988</p>
+                        <p className="text-[10px] text-slate-400">浙江省杭州市西湖区文三路古荡科技园 A座3楼</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 奢华增值定制选项 */}
+                  <div className="bg-[#11131c] rounded-xl p-3 border border-slate-900 space-y-3">
+                    <span className="text-[10px] font-bold text-slate-500 tracking-wider block">尊贵包装定制服务</span>
+                    
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <i data-lucide="box" className="w-4 h-4 text-slate-400"></i>
+                        <div>
+                          <p className="text-[10px] text-slate-300">手工奢华深空绒皮礼盒</p>
+                          <p className="text-[9px] text-slate-500">配套香薰干花与纯金丝带寄语</p>
+                        </div>
+                      </div>
+                      <input 
+                        type="checkbox" 
+                        checked={needLuxuryBox}
+                        onChange={(e) => setNeedLuxuryBox(e.target.checked)}
+                        className="w-4 h-4 accent-indigo-500" 
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <i data-lucide="qr-code" className="w-4 h-4 text-slate-400"></i>
+                        <div>
+                          <p className="text-[10px] text-slate-300">实体贺卡专属 AI 声音二维码</p>
+                          <p className="text-[9px] text-slate-500">实体包装上印专属二维码，扫码立听温暖语音</p>
+                        </div>
+                      </div>
+                      <input 
+                        type="checkbox" 
+                        checked={needAudioQR}
+                        onChange={(e) => setNeedAudioQR(e.target.checked)}
+                        className="w-4 h-4 accent-indigo-500" 
+                      />
+                    </div>
+                  </div>
+
+                  {/* 费用总结 */}
+                  <div className="bg-[#11131c] rounded-xl p-3 border border-slate-900 text-[11px] space-y-2">
+                    <div className="flex justify-between text-slate-400">
+                      <span>礼品小计</span>
+                      <span>¥{cart.reduce((s, i) => s + i.price, 0)}</span>
+                    </div>
+                    {needLuxuryBox && (
+                      <div className="flex justify-between text-slate-400">
+                        <span>高级绒礼包装</span>
+                        <span>+ ¥68</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-slate-400">
+                      <span>运费 (顺丰特快)</span>
+                      <span className="text-emerald-400">免运费</span>
+                    </div>
+                    <div className="flex justify-between text-sm font-bold text-white pt-2 border-t border-slate-900">
+                      <span>最终金额</span>
+                      <span>¥{cart.reduce((s, i) => s + i.price, 0) + (needLuxuryBox ? 68 : 0)}</span>
+                    </div>
+                  </div>
+
+                  {/* 微信 / Apple Pay 整合安全支付按钮 */}
+                  <button
+                    onClick={handlePayOrder}
+                    className="w-full py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:opacity-95 text-[12px] font-bold text-white rounded-xl text-center active:scale-95 transition-transform flex items-center justify-center space-x-1.5 shadow-lg"
+                  >
+                    <i data-lucide="credit-card" className="w-4 h-4"></i>
+                    <span>微信 / 快捷支付安全扣款</span>
+                  </button>
+
+                </div>
+              </div>
+            )}
+
+            {/* 6. 支付订单成功 & 二维码语音卡片查看 (Order Success Screen) */}
+            {page === 'order-success' && latestOrder && (
+              <div className="px-5 py-4 animate-fadeIn">
+                <div className="text-center py-6">
+                  <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto mb-3">
+                    <i data-lucide="check" className="w-6 h-6 text-emerald-400"></i>
+                  </div>
+                  <h3 className="text-base font-bold text-white">订单支付成功</h3>
+                  <p className="text-[10px] text-slate-500 mt-1">单号：{latestOrder.orderId}</p>
+                </div>
+
+                <div className="space-y-4">
+                  {/* 实体二维码语音卡片预览 */}
+                  {needAudioQR && (
+                    <div className="bg-gradient-to-br from-indigo-950/40 via-purple-950/20 to-[#0e1017] border border-indigo-500/20 rounded-2xl p-4">
+                      <div className="flex items-center space-x-1.5 mb-3">
+                        <i data-lucide="qr-code" className="w-4 h-4 text-cyan-400"></i>
+                        <span className="text-[10px] font-bold text-cyan-400 tracking-wider">配音卡片二维码已随件印发</span>
+                      </div>
+                      
+                      <div className="flex items-center space-x-4">
+                        {/* 极精美的模拟 SVG 二维码图案 */}
+                        <div className="w-20 h-20 bg-white p-1.5 rounded-lg shrink-0 flex items-center justify-center relative">
+                          <svg className="w-full h-full text-slate-900" viewBox="0 0 100 100">
+                            <rect x="0" y="0" width="30" height="30" fill="currentColor" />
+                            <rect x="5" y="5" width="20" height="20" fill="white" />
+                            <rect x="10" y="10" width="10" height="10" fill="currentColor" />
+                            
+                            <rect x="70" y="0" width="30" height="30" fill="currentColor" />
+                            <rect x="75" y="5" width="20" height="20" fill="white" />
+                            <rect x="80" y="10" width="10" height="10" fill="currentColor" />
+                            
+                            <rect x="0" y="70" width="30" height="30" fill="currentColor" />
+                            <rect x="5" y="75" width="20" height="20" fill="white" />
+                            <rect x="10" y="80" width="10" height="10" fill="currentColor" />
+                            
+                            <path d="M 40,10 H 50 V 20 H 40 Z" fill="currentColor" />
+                            <path d="M 10,40 H 20 V 50 H 10 Z" fill="currentColor" />
+                            <path d="M 50,40 H 60 V 60 H 50 Z" fill="currentColor" />
+                            <path d="M 80,40 H 90 V 60 H 80 Z" fill="currentColor" />
+                            <path d="M 40,70 H 60 V 80 H 40 Z" fill="currentColor" />
+                            <path d="M 70,70 H 90 V 90 H 70 Z" fill="currentColor" />
+                          </svg>
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="w-5 h-5 bg-black rounded-md border border-indigo-500/50 flex items-center justify-center">
+                              <i data-lucide="mic" className="w-2.5 h-2.5 text-indigo-400"></i>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex-1">
+                          <p className="text-[11px] font-bold text-white">收信人扫一扫听到你</p>
+                          <p className="text-[10px] text-slate-400 leading-relaxed mt-1">
+                            对方在拆礼盒时，只需用手机摄像头扫描此贺卡卡片，即可立时听到你在客户端合成的高品质祝福。
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 顺丰轨迹进度条 */}
+                  <div className="bg-[#11131c] rounded-xl p-3 border border-slate-900">
+                    <span className="text-[10px] font-bold text-slate-500 tracking-wider block mb-2">一公里物流节点轨迹</span>
+                    <div className="flex items-center space-x-3 text-[11px]">
+                      <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping shrink-0"></div>
+                      <span className="text-indigo-400 font-bold">顺丰揽件中：浙江省杭州市西湖区古荡揽投部</span>
+                    </div>
+                  </div>
+
+                  {/* 返回首页 */}
+                  <button
+                    onClick={() => setPage('home')}
+                    className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-[11px] font-bold text-slate-300 rounded-xl text-center active:scale-95 transition-transform"
+                  >
+                    返回首页尊享阁
+                  </button>
+                </div>
+              </div>
+            )}
+
+          </div>
+
+          {/* ========================================== */}
+          {/* 原生 App 导航 Tab 栏 */}
+          {/* ========================================== */}
+          <div className="absolute bottom-0 left-0 right-0 h-16 bg-[#090a0f] border-t border-slate-900/60 flex items-center justify-around px-4 pb-2 z-40">
+            <button 
+              onClick={() => setPage('home')}
+              className={`flex flex-col items-center space-y-1 ${page === 'home' ? 'text-indigo-500' : 'text-slate-500'}`}
+            >
+              <i data-lucide="home" className="w-5 h-5"></i>
+              <span className="text-[9px] font-semibold">首 页</span>
+            </button>
+            <button 
+              onClick={() => setPage('wizard')}
+              className={`flex flex-col items-center space-y-1 ${page === 'wizard' || page === 'recommendations' ? 'text-indigo-500' : 'text-slate-500'}`}
+            >
+              <i data-lucide="sparkles" className="w-5 h-5"></i>
+              <span className="text-[9px] font-semibold">AI送礼</span>
+            </button>
+            <button 
+              onClick={() => setPage('cart')}
+              className={`flex flex-col items-center space-y-1 relative ${page === 'cart' ? 'text-indigo-500' : 'text-slate-500'}`}
+            >
+              <i data-lucide="shopping-bag" className="w-5 h-5"></i>
+              {cart.length > 0 && (
+                <span className="absolute top-0 right-1 bg-indigo-500 text-[8px] text-white w-3.5 h-3.5 rounded-full flex items-center justify-center font-extrabold">
+                  {cart.length}
+                </span>
+              )}
+              <span className="text-[9px] font-semibold">购物车</span>
+            </button>
+            <button 
+              onClick={() => {
+                if (latestOrder) {
+                  setPage('order-success');
+                } else {
+                  showToast("您当前还没有成功下单配送的礼品记录");
+                }
+              }}
+              className={`flex flex-col items-center space-y-1 ${page === 'order-success' ? 'text-indigo-500' : 'text-slate-500'}`}
+            >
+              <i data-lucide="truck" className="w-5 h-5"></i>
+              <span className="text-[9px] font-semibold">物流单</span>
+            </button>
+          </div>
+
+        </div>
+      );
+    }
+
+    // 渲染根挂载点
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
+  `);
+});
+
+// ====================================================================
+// 服务器启动监视
+// ====================================================================
+app.listen(PORT, () => {
+  console.log(`\n======================================================`);
+  console.log(`🚀 [GiftyAI] 极客级 AI 送礼全栈服务已在本地完全启动！`);
+  console.log(`🔗 预览地址：http://localhost:${PORT}`);
+  console.log(`🔑 云端 Key：${GEMINI_API_KEY ? "已检测到合法的 GEMINI_API_KEY" : "未检测到 GEMINI_API_KEY（已自适应降级为 Mock 模式）"}`);
+  console.log(`======================================================\n`);
+});

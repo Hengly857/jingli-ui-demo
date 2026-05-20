@@ -2,10 +2,12 @@
 
 这是一个面向移动端体验的 **京礼 AI 送礼推荐 Demo**。用户可以用自然语言描述送礼对象、场景和预算，系统会调用后端 AI 导购能力，基于商品知识库生成推荐文本和商品卡片，并支持把推荐商品加入礼单。
 
+当前主前端已经更新为 **v2 移动端原型**：采用更接近真实手机 App 的设备外壳、白底轻奢视觉、AI 送礼画像表单、推荐结果卡片、购物车和结算流程。旧版 `/jingli` 页面仍保留，主要用于对照和兼容测试。
+
 当前项目已经整理成标准前后端结构：
 
 ```text
-frontend/              前端移动端 UI
+frontend/              前端移动端 UI（当前主入口为 /v2/home）
 backend/               后端 API、AI 导购、知识库检索、礼单接口
 storage/sample_docs/   商品知识库种子数据
 ```
@@ -104,6 +106,19 @@ npm run dev
 浏览器访问：
 
 ```text
+http://localhost:3000/v2/home
+```
+
+v2 常用页面：
+
+- `http://localhost:3000/v2/home`：新版首页
+- `http://localhost:3000/v2/wizard`：AI 送礼画像表单
+- `http://localhost:3000/v2/recommendations`：AI 推荐结果页（需要先从画像表单生成）
+- `http://localhost:3000/v2/cart`：购物车/礼单
+
+旧版页面仍可访问：
+
+```text
 http://localhost:3000/jingli
 ```
 
@@ -151,11 +166,13 @@ python -m app.scripts.validate_products
 
 ## 常见问题
 
-如果访问 `http://localhost:3000/jingli` 出现 404，通常是前端启动目录错了。请确认是在 `frontend/` 目录执行：
+如果访问 `http://localhost:3000/v2/home` 出现 404，通常是前端启动目录错了，或者访问的不是 Vite 前端服务。请确认是在 `frontend/` 目录执行：
 
 ```bash
 npm run dev
 ```
+
+如果你打开的是后端地址 `http://localhost:8000/v2/home`，也会 404；前端页面应访问 `http://localhost:3000/v2/home`。
 
 如果 AI 回复是 `Mock LLM response.`，说明后端没有读取到真实模型配置。请检查：
 
